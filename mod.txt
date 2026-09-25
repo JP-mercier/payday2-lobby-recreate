@@ -1,0 +1,27 @@
+{
+	"name": "Lobby Recreate",
+	"description": "Host only. Press the keybind in the lobby to close it, open a new one with the same heist and settings, and auto-invite everyone who was in it.",
+	"author": "jpmercier",
+	"version": "1.0",
+	"hooks": [
+		{
+			"hook_id": "lib/managers/menumanager",
+			"script_path": "lua/core.lua"
+		},
+		{
+			"hook_id": "lib/network/base/basenetworksession",
+			"script_path": "lua/core.lua"
+		}
+	],
+	"keybinds": [
+		{
+			"keybind_id": "lobby_recreate_key",
+			"name": "Recreate Lobby",
+			"description": "Close this lobby, open a fresh one with the same settings and re-invite everyone.",
+			"script_path": "lua/keybind.lua",
+			"run_in_menu": true,
+			"run_in_game": false,
+			"localized": false
+		}
+	]
+}
