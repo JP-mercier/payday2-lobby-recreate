@@ -1,10 +1,11 @@
 -- Lobby Recreate
--- Host only: closes the current lobby, opens a new one with the same heist and
--- settings, then sends a lobby invite to everyone who was in the old one.
+-- Leaves the current lobby, hosts a new one with the same heist and settings,
+-- then sends a lobby invite to everyone who was in the old one.
+-- Works as host or as client (as client, you become the host of the new lobby).
 -- Nobody else needs the mod; they just accept the invite.
 
 LobbyRecreate = LobbyRecreate or {
-	roster = {}, -- [user_id] = { user_id = ..., name = ... }, players seen in the current lobby
+	roster = {}, -- [user_id] = { user_id = ..., name = ..., lobby = lobby id string }, players seen per lobby
 	state = nil -- nil | "leaving" | "creating" | "inviting"
 }
 
@@ -47,12 +48,12 @@ function LR:_can_recreate()
 
 	local session = managers.network and managers.network:session()
 
-	if not session or not session:is_host() or Global.game_settings.single_player then
-		return false, "You need to be the host of an online lobby."
+	if not session or Global.game_settings.single_player then
+		return false, "You need to be in an online lobby."
 	end
 
 	if not managers.network.matchmake.lobby_handler then
-		return false, "Couldn't find your Steam lobby."
+		return false, "Couldn't find the Steam lobby."
 	end
 
 	if managers.crime_spree and managers.crime_spree:is_active() then
@@ -66,11 +67,19 @@ function LR:_can_recreate()
 	return true
 end
 
--- Everyone currently connected, plus anyone who dropped from a connection
--- problem since the lobby was opened. Kicked players are left out.
+function LR:_current_lobby_id()
+	local handler = managers.network and managers.network.matchmake and managers.network.matchmake.lobby_handler
+
+	return handler and tostring(handler:id())
+end
+
+-- Everyone currently connected (the host included, when you're a client), plus
+-- anyone who dropped from a connection problem while in this lobby.
+-- Kicked players are left out.
 function LR:_collect_invites()
 	local session = managers.network:session()
 	local my_id = session:local_peer() and tostring(session:local_peer():user_id())
+	local lobby_id = self:_current_lobby_id()
 	local list, seen = {}, {}
 
 	local function add(user_id, name)
@@ -93,10 +102,48 @@ function LR:_collect_invites()
 	end
 
 	for _, entry in pairs(self.roster) do
-		add(entry.user_id, entry.name)
+		if entry.lobby == lobby_id then
+			add(entry.user_id, entry.name)
+		end
 	end
 
 	return list
+end
+
+-- As a client, Global.game_settings holds your own hosting preferences, not the
+-- host's. The host's settings are published in the Steam lobby data.
+function LR:_read_host_settings()
+	local data = managers.network.matchmake:get_lobby_data()
+
+	if not data then
+		return nil
+	end
+
+	local permission = tweak_data:index_to_permission(tonumber(data.permission))
+
+	return {
+		permission = permission,
+		drop_in_option = tonumber(data.drop_in),
+		kick_option = tonumber(data.kick_option),
+		job_plan = tonumber(data.job_plan)
+	}
+end
+
+function LR:_apply_host_settings(settings)
+	if not settings then
+		return
+	end
+
+	for key, value in pairs(settings) do
+		Global.game_settings[key] = value
+	end
+end
+
+function LR:_host_name()
+	local session = managers.network:session()
+	local host = session and session:server_peer()
+
+	return host and host:name() or "the host"
 end
 
 function LR:request()
@@ -108,8 +155,15 @@ function LR:request()
 		return
 	end
 
+	local is_host = managers.network:session():is_host()
 	local list = self:_collect_invites()
 	local text
+
+	if is_host then
+		text = "Close this lobby and open a fresh one with the same heist and settings?"
+	else
+		text = "Leave " .. self:_host_name() .. "'s lobby and host a fresh one with the same heist and settings? You will be the host of the new lobby."
+	end
 
 	if #list > 0 then
 		local names = {}
@@ -118,9 +172,15 @@ function LR:request()
 			table.insert(names, "- " .. p.name)
 		end
 
-		text = "Close this lobby and open a fresh one with the same heist and settings?\n\nThese players will get an invite:\n" .. table.concat(names, "\n") .. "\n\nThey'll see \"host left\" for a moment, then the invite shows up."
+		text = text .. "\n\nThese players will get an invite:\n" .. table.concat(names, "\n")
+
+		if is_host then
+			text = text .. "\n\nThey'll see \"host left\" for a moment, then the invite shows up."
+		else
+			text = text .. "\n\nThey stay in the old lobby until they accept."
+		end
 	else
-		text = "Close this lobby and open a fresh one with the same heist and settings?\n\nNobody to re-invite right now."
+		text = text .. "\n\nNobody to invite right now."
 	end
 
 	QuickMenu:new("Recreate lobby?", text, {
@@ -146,19 +206,26 @@ function LR:_start(list)
 		return
 	end
 
+	local is_host = managers.network:session():is_host()
+
 	self.state = "leaving"
 	self._invites = list
+	-- Job, difficulty and One Down are synced to clients by the host, so these
+	-- are correct in both roles
 	self._job = {
 		job_id = managers.job:current_job_id(),
 		difficulty = Global.game_settings.difficulty,
 		one_down = Global.game_settings.one_down
 	}
+	self._host_settings = not is_host and self:_read_host_settings() or nil
 
-	self:log("Recreating lobby, job=" .. tostring(self._job.job_id) .. ", invites=" .. #list)
+	self:log("Recreating lobby as " .. (is_host and "host" or "client") .. ", job=" .. tostring(self._job.job_id) .. ", invites=" .. #list)
 
 	-- Plain chat message, so players without the mod know what's happening
+	local announcement = is_host and "Recreating the lobby to fix connection issues, accept my invite in a few seconds!" or "Making a new lobby to fix connection issues, I'll host it. Accept my invite in a few seconds!"
+
 	pcall(function()
-		managers.chat:send_message(ChatManager.GAME, nil, "Recreating the lobby to fix connection issues, accept my invite in a few seconds!")
+		managers.chat:send_message(ChatManager.GAME, nil, announcement)
 	end)
 
 	DelayedCalls:Add("LobbyRecreate_leave", LEAVE_DELAY, function()
@@ -225,6 +292,9 @@ function LR:_create()
 
 	local job = self._job
 	local ok, err = pcall(function()
+		-- Coming from someone else's lobby: host with their settings, not yours
+		self:_apply_host_settings(self._host_settings)
+
 		if job.job_id then
 			MenuCallbackHandler:start_job({
 				job_id = job.job_id,
@@ -305,11 +375,12 @@ function LR:_send_invites()
 		end
 
 		-- Keep them in the roster so pressing the key again re-invites them too
-		self.roster[tostring(p.user_id)] = p
+		self.roster[tostring(p.user_id)] = { user_id = p.user_id, name = p.name, lobby = tostring(lobby_id) }
 	end
 
 	self.state = nil
 	self._invites = nil
+	self._host_settings = nil
 
 	if #sent > 0 then
 		self:say("New lobby is up. Invited: " .. table.concat(sent, ", "))
@@ -333,17 +404,21 @@ if RequiredScript == "lib/managers/menumanager" then
 		end
 	end)
 elseif RequiredScript == "lib/network/base/basenetworksession" then
+	-- Roster is tracked as host and as client. Entries are tagged with the lobby
+	-- they were seen in, so joining another lobby doesn't carry old players over.
 	Hooks:PostHook(BaseNetworkSession, "add_peer", "LobbyRecreate_add_peer", function(self, name, rpc, in_lobby, loading, synched, id, character, user_id)
-		if LR.state or not self:is_host() or not user_id then
+		local lobby_id = LR:_current_lobby_id()
+
+		if LR.state or not user_id or not lobby_id then
 			return
 		end
 
-		LR.roster[tostring(user_id)] = { user_id = user_id, name = name }
+		LR.roster[tostring(user_id)] = { user_id = user_id, name = name, lobby = lobby_id }
 	end)
 
 	Hooks:PostHook(BaseNetworkSession, "remove_peer", "LobbyRecreate_remove_peer", function(self, peer, peer_id, reason)
 		-- "lost" (connection dropped) stays on the roster, a normal leave doesn't
-		if LR.state or not self:is_host() or not peer or reason ~= "left" then
+		if LR.state or not peer or reason ~= "left" then
 			return
 		end
 
@@ -351,7 +426,7 @@ elseif RequiredScript == "lib/network/base/basenetworksession" then
 	end)
 
 	Hooks:PostHook(BaseNetworkSession, "on_peer_kicked", "LobbyRecreate_on_peer_kicked", function(self, peer)
-		if peer and self:is_host() then
+		if peer then
 			LR.roster[tostring(peer:user_id())] = nil
 		end
 	end)
